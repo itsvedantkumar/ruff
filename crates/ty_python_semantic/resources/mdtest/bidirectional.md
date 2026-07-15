@@ -2250,6 +2250,8 @@ def _(dtype: FloatDtype):
     reveal_type(x)  # revealed: float
 ```
 
+Intersection bindings are similarly evaluated under fixpoint iteration:
+
 ```py
 from typing import Protocol, runtime_checkable
 
@@ -2297,6 +2299,21 @@ class Command: ...
 def _(command: Any):
     # revealed: dict[str, Any]
     mapping: DictLike[type[Command]] = reveal_type({"command": command})
+```
+
+Type context specialized to a gradual type should not be ignored:
+
+```py
+from ty_extensions import Unknown
+
+def merge[K, V](*maps: dict[K, V]) -> tuple[K, V]:
+    raise NotImplementedError
+
+def _(dynamic: Unknown):
+    # TODO: This should not error.
+    # error: [invalid-argument-type]
+    # error: [invalid-argument-type]
+    reveal_type(merge({"a": 1}, {2: "b"}, dynamic))  # revealed: tuple[str | int | Unknown, int | str | Unknown]
 ```
 
 Note that long chains of callables with constraint dependencies in reverse source-order may require
