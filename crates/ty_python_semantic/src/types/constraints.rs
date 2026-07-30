@@ -8133,7 +8133,7 @@ mod tests {
                     .negate(storage)
                     .or(storage, bytes_u)
             },
-            ["never=false always=false merged=[] paths=[unconstrained]"],
+            ["never=false always=false merged=[U=bytes] paths=[; U=bytes]"],
         );
     }
 
