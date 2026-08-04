@@ -2459,8 +2459,6 @@ fn max_constructor_and_typevar_depth<'db>(
 
 impl<'db> Constraint<'db> {
     /// Returns a new range constraint, preserving whether each bound was present explicitly.
-    ///
-    /// Panics if present `lower` and `upper` bounds are not fully static.
     fn new_node_with_bounds(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
