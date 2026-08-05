@@ -44,8 +44,9 @@
 //! When `if_uncertain` is `ALWAYS_FALSE` everywhere, the TDD degenerates to a standard BDD, and
 //! all operations have zero overhead compared to the binary case.
 //!
-//! Gradual materializations are represented by opaque decision nodes. They participate in the
-//! decision diagram but do not carry bounds or produce solutions.
+//! Constraints on the materialization of a gradual type are represented by opaque existential
+//! variables. They participate in the decision diagram but do not carry bounds or produce
+//! solutions.
 //!
 //! NOTE: This module is currently in a transitional state. We've added the BDD [`ConstraintSet`]
 //! representation, and updated all of our property checks to build up a constraint set and then
@@ -491,6 +492,7 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
     ) -> Self {
         let mut storage = builder.storage.borrow_mut();
         let (node, source_order) = variable.new_node(db, env, &mut storage);
+
         Self::from_node(builder, node, source_order)
     }
 
@@ -865,7 +867,7 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
     /// Replaces each opaque gradual decision with a fresh builder-local identity.
     ///
     /// Cached relation results can be reused for distinct gradual occurrences. Freshening prevents
-    /// their materialization decisions from being incorrectly shared.
+    /// their materialization decisions from being conflated.
     pub(super) fn freshen_gradual_variables(
         self,
         db: &'db dyn Db,
@@ -930,7 +932,7 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
                 };
                 let variable = *variables
                     .entry(gradual)
-                    .or_insert_with(|| storage.new_gradual_variable());
+                    .or_insert_with(|| storage.next_gradual_variable());
                 mapped_constraints.insert(constraint_id, variable.new_node(db, env, storage));
             });
 
@@ -1436,7 +1438,7 @@ impl<'db> ConstraintSetBuilder<'db> {
     /// avoids remapping and preserves the original TDD structure.
     ///
     /// Each load also gives the owned set's opaque gradual decisions fresh builder-local
-    /// identities, preventing distinct loads from sharing materialization conditions.
+    /// identities, preventing distinct loads from conflating unrelated gradual constraints.
     pub(crate) fn load<'c>(
         &'c self,
         db: &'db dyn Db,
@@ -1448,8 +1450,8 @@ impl<'db> ConstraintSetBuilder<'db> {
         ConstraintSet::from_node(self, node, source_order)
     }
 
-    pub(super) fn new_gradual_variable(&self) -> GradualVariableId {
-        self.storage.borrow_mut().new_gradual_variable()
+    pub(super) fn next_gradual_variable(&self) -> GradualVariableId {
+        self.storage.borrow_mut().next_gradual_variable()
     }
 }
 
@@ -1568,7 +1570,7 @@ impl<'db> ConstraintSetStorage<'db> {
         id
     }
 
-    fn new_gradual_variable(&mut self) -> GradualVariableId {
+    fn next_gradual_variable(&mut self) -> GradualVariableId {
         let id = GradualVariableId::from_usize(self.gradual_variable_count);
         self.gradual_variable_count += 1;
         self.adjusted_gradual_variable_id(id)
@@ -1897,7 +1899,7 @@ impl<'db> ConstraintSetStorage<'db> {
         // order-independent.)
         let gradual_variables: IndexVec<GradualVariableId, GradualVariableId> = (0..inner
             .gradual_variable_count)
-            .map(|_| self.new_gradual_variable())
+            .map(|_| self.next_gradual_variable())
             .collect();
         let constraints: Box<[_]> = inner
             .constraints
@@ -2014,7 +2016,7 @@ enum IntersectionResult<'db> {
 #[derive(Ord, PartialOrd, get_size2::GetSize)]
 pub struct TypeVarId;
 
-/// The builder-local identity of one gradual materialization decision.
+/// The builder-local identity of one gradual materialization constraint.
 #[newtype_index]
 #[derive(Ord, PartialOrd, get_size2::GetSize)]
 pub(super) struct GradualVariableId;
