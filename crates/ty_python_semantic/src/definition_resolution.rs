@@ -36,7 +36,8 @@ impl<'db> DefinitionResolution<'db> {
         &self.definitions
     }
 
-    fn from_bindings(
+    /// Resolves the definitions supplied by the given bindings.
+    pub(crate) fn from_bindings(
         db: &'db dyn Db,
         mut bindings: BindingWithConstraintsIterator<'db, 'db>,
     ) -> Self {
