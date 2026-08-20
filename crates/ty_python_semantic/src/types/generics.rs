@@ -13,7 +13,7 @@ use crate::types::class::ClassType;
 use crate::types::class_base::ClassBase;
 use crate::types::constraints::{
     ConstraintBounds, ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension, PathBound,
-    PathBounds, Solution, Solutions,
+    PathBounds, Solution, Solutions, TypeVarSolution,
 };
 use crate::types::infer::original_class_type;
 use crate::types::relation::{
@@ -2713,19 +2713,18 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             Solutions::Constrained(solutions) => solutions,
         };
 
-        let mut types = FxHashMap::default();
-        for solution in solutions {
-            for binding in solution {
-                let identity = binding.bound_typevar.identity(db);
-                types
-                    .entry(identity)
-                    .and_modify(|existing| {
-                        *existing =
-                            UnionType::from_two_elements(db, self.env, *existing, binding.solution);
-                    })
-                    .or_insert(binding.solution);
-            }
+        let mut bindings: FxHashMap<_, TypeVarSolution<'db>> = FxHashMap::default();
+        for binding in solutions.into_iter().flatten() {
+            let identity = binding.bound_typevar.identity(db);
+            bindings
+                .entry(identity)
+                .and_modify(|existing| self.merge_solutions(existing, &binding))
+                .or_insert(binding);
         }
+        let mut types: FxHashMap<_, _> = bindings
+            .into_iter()
+            .map(|(identity, binding)| (identity, binding.solution))
+            .collect();
 
         // Sequent-map transitivity can add relationships between inferable typevars to path
         // bounds. Those relationships are important while solving, but should not become recursive
@@ -2753,6 +2752,115 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         } else {
             Ok(types)
         }
+    }
+
+    /// Merges alternative solutions without treating gradual materializations as independent bounds.
+    fn merge_solutions(
+        &self,
+        existing: &mut TypeVarSolution<'db>,
+        candidate: &TypeVarSolution<'db>,
+    ) {
+        if existing.solution == candidate.solution {
+            existing
+                .provenance
+                .merge(self.db, self.env, &candidate.provenance);
+            return;
+        }
+
+        // TODO: Structural `object` alternatives should be handled by intersection solving.
+        let gradual_solution = if existing.solution == Type::object() {
+            Some(candidate.solution)
+        } else if candidate.solution == Type::object() {
+            Some(existing.solution)
+        } else {
+            None
+        };
+        if let Some(solution) = gradual_solution
+            && let Some(gradual) = solution.as_dynamic().or_else(|| {
+                solution
+                    .as_union()?
+                    .elements(self.db)
+                    .iter()
+                    .find_map(|element| element.as_dynamic())
+            })
+        {
+            existing.solution = solution;
+            existing
+                .provenance
+                .merge(self.db, self.env, &candidate.provenance);
+            existing.provenance.retain_gradual_type(gradual);
+            return;
+        }
+
+        if self.solution_absorbs(existing, candidate) {
+            return;
+        }
+        if self.solution_absorbs(candidate, existing) {
+            *existing = candidate.clone();
+            return;
+        }
+
+        let (first, second) =
+            if candidate.provenance.has_explicit_any() && !existing.provenance.has_explicit_any() {
+                (candidate.solution, existing.solution)
+            } else {
+                (existing.solution, candidate.solution)
+            };
+        existing.solution = UnionType::from_two_elements(self.db, self.env, first, second);
+        existing
+            .provenance
+            .merge(self.db, self.env, &candidate.provenance);
+    }
+
+    /// Whether one solution covers another without discarding independent lower-bound evidence.
+    fn solution_absorbs(
+        &self,
+        retained: &TypeVarSolution<'db>,
+        alternative: &TypeVarSolution<'db>,
+    ) -> bool {
+        let retained_provenance = &retained.provenance;
+        let alternative_provenance = &alternative.provenance;
+        if !alternative_provenance
+            .lower_origins
+            .iter()
+            .all(|origin| retained_provenance.lower_origins.contains(origin))
+        {
+            return false;
+        }
+
+        // Unresolved candidates cannot establish independent concrete bounds before substitution.
+        if let Some(alternative_lower) = alternative_provenance.concrete_lower
+            && !alternative.solution.has_typevar(self.db, self.env)
+            && !alternative
+                .solution
+                .has_provisional_marker(self.db, self.env)
+            && !retained_provenance
+                .concrete_lower
+                .is_some_and(|retained_lower| {
+                    alternative_lower.is_subtype_of(self.db, self.env, retained_lower)
+                })
+        {
+            return false;
+        }
+
+        // An unconditional gradual lower bound covers any individual materialization that does
+        // not introduce a separately required concrete bound.
+        if retained_provenance.concrete_lower.is_none()
+            && retained_provenance.unconditional_gradual_lower == Some(retained.solution)
+            && retained_provenance.unconditional_gradual_lower
+                == alternative_provenance.unconditional_gradual_lower
+        {
+            return true;
+        }
+
+        retained_provenance.lower_origins.iter().any(|&origin| {
+            alternative_provenance
+                .materialization_origins
+                .contains(&origin)
+                && (retained_provenance.concrete_lower.is_none()
+                    && retained.solution == Type::Dynamic(origin.ty)
+                    || !alternative_provenance.contains_origin(origin))
+        })
     }
 
     fn has_expanding_cycle(

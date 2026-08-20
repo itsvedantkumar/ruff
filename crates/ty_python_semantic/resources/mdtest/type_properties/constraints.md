@@ -1351,6 +1351,51 @@ second = is_constraint_set_assignable_to(Any, str)
 reveal_type((first & second).with_detailed_display())
 ```
 
+Independent materializations remain distinct even when their relations are identical:
+
+```py
+same_target = is_constraint_set_assignable_to(Any, int)
+
+# revealed: ConstraintSet[((gradual@0) ∧ (gradual@1))]
+reveal_type((first & same_target).with_detailed_display())
+```
+
+Gradual alternatives retain their origins when they constrain the same type variable.
+
+```py
+from ty_extensions._internal import Unknown
+
+def _[T]() -> None:
+    first = is_constraint_set_assignable_to(Any, tuple[T] | None)
+    second = is_constraint_set_assignable_to(Unknown, tuple[T] | None)
+    concrete = ConstraintSet.lower_bound(int, T)
+
+    # revealed: tuple[Solution[T=Any | int], Solution[T=Unknown | int], Solution[T=int]]
+    reveal_type(((first | second) & concrete).solutions_for(T, inferable=tuple[T]))
+    # revealed: tuple[Solution[T=int], Solution[T=int | Any], Solution[T=int | Unknown]]
+    reveal_type((concrete & (first | second)).solutions_for(T, inferable=tuple[T]))
+```
+
+Concrete solutions remain distinct when they arise from unrelated gradual occurrences.
+
+```py
+def choose[T](
+    value: tuple[T, int, object] | tuple[T, object, int] | tuple[object, tuple[T], object],
+) -> T:
+    raise NotImplementedError
+
+def reversed_choose[T](
+    value: tuple[T, object, int] | tuple[T, int, object] | tuple[object, tuple[T], object],
+) -> T:
+    raise NotImplementedError
+
+def _(first: Any, second: Unknown, lower: int):
+    reveal_type(choose((lower, first, second)))  # revealed: int | Any
+    reveal_type(reversed_choose((lower, first, second)))  # revealed: int | Any
+    reveal_type(choose((lower, second, first)))  # revealed: int | Unknown
+    reveal_type(reversed_choose((lower, second, first)))  # revealed: int | Unknown
+```
+
 Recursive protocol checks retain their gradual variables instead of falling back to `Unknown`.
 
 ```py

@@ -1,20 +1,35 @@
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use crate::types::constraints::support::Support;
 use crate::types::constraints::{
     ALWAYS_FALSE, ConstraintAssignment, ConstraintBoundsBuilder, ConstraintId,
-    ConstraintSetStorage, Node, NodeId, PathAssignments, PathBounds,
+    ConstraintProvenance, ConstraintSetStorage, GradualVariableId, Node, NodeId, PathAssignments,
+    PathBounds,
 };
 use crate::types::typevar::TypeVarSet;
 use crate::types::{BoundTypeVarInstance, Type};
 use crate::{Db, FxIndexMap, FxIndexSet, ProgramEnvironment};
 
+/// A satisfying constraint path.
+struct ConstraintPath {
+    constraints: Vec<(ConstraintId, usize, ConstraintProvenance)>,
+    /// The gradual occurrences whose materializations satisfy this constraint path.
+    materialization_origins: GradualOrigins,
+}
+
+type PathAssignmentKey = (ConstraintAssignment, ConstraintId, ConstraintProvenance);
+type GradualOrigins = SmallVec<[GradualVariableId; 2]>;
+
 pub(super) struct SolutionWalker<'db> {
     inferable: TypeVarSet<'db>,
     inferable_support: Support,
     source_orders: FxIndexSet<ConstraintId>,
-    explored_nodes: FxHashSet<(NodeId, Vec<(ConstraintAssignment, ConstraintId)>)>,
-    sorted_paths: Vec<Vec<(ConstraintId, usize)>>,
+    relevant_gradual_origins: FxHashSet<GradualVariableId>,
+    relevant_gradual_nodes: FxHashMap<NodeId, bool>,
+    explored_nodes: FxHashSet<(NodeId, Vec<PathAssignmentKey>)>,
+    explored_gradual_nodes: FxHashSet<(NodeId, Vec<PathAssignmentKey>, GradualOrigins)>,
+    sorted_paths: Vec<ConstraintPath>,
 }
 
 impl<'db> SolutionWalker<'db> {
@@ -25,11 +40,24 @@ impl<'db> SolutionWalker<'db> {
         source_orders: FxIndexSet<ConstraintId>,
     ) -> Self {
         let inferable_support = Support::from_typevar_set(db, storage, inferable);
+        let relevant_gradual_origins = if storage.has_gradual_variables() {
+            source_orders
+                .iter()
+                .filter_map(|constraint| storage.constraint_data(*constraint).as_typevar())
+                .flat_map(|constraint| [constraint.provenance.lower, constraint.provenance.upper])
+                .flatten()
+                .collect()
+        } else {
+            FxHashSet::default()
+        };
         Self {
             inferable,
             inferable_support,
             source_orders,
+            relevant_gradual_origins,
+            relevant_gradual_nodes: FxHashMap::default(),
             explored_nodes: FxHashSet::default(),
+            explored_gradual_nodes: FxHashSet::default(),
             sorted_paths: Vec::default(),
         }
     }
@@ -49,15 +77,19 @@ impl<'db> SolutionWalker<'db> {
         storage: &ConstraintSetStorage<'db>,
         path: &PathAssignments,
         support: &Support,
-    ) -> impl Iterator<Item = (ConstraintAssignment, ConstraintId)> {
+    ) -> impl Iterator<Item = PathAssignmentKey> {
         path.assignments
             .iter()
             .filter_map(|(assignment, (source_constraint, _))| {
                 let constraint = assignment.as_constrained()?;
                 let constraint_support = storage.constraint_support(constraint);
-                constraint_support
-                    .overlaps_with(support)
-                    .then_some((*assignment, *source_constraint))
+                constraint_support.overlaps_with(support).then(|| {
+                    (
+                        *assignment,
+                        *source_constraint,
+                        path.constraint_provenance(*assignment),
+                    )
+                })
             })
     }
 
@@ -84,9 +116,23 @@ impl<'db> SolutionWalker<'db> {
         relevant_typevars.close_over_constraints(storage, &Self::constrained_assignments(path));
         let mut relevant_path: Vec<_> =
             Self::constrained_assignments_mentioning(storage, path, &relevant_typevars).collect();
-        relevant_path.sort_unstable_by_key(|(assignment, _)| assignment.constraint().ordering());
-        let key = (node, relevant_path);
-        if !self.explored_nodes.insert(key) {
+        relevant_path.sort_unstable_by_key(|(assignment, _, _)| assignment.constraint().ordering());
+        let is_unexplored = if self.relevant_gradual_origins.is_empty() {
+            self.explored_nodes.insert((node, relevant_path))
+        } else {
+            let mut gradual_origins = GradualOrigins::new();
+            for origin in path.gradual_origins(storage) {
+                if self.relevant_gradual_origins.contains(&origin)
+                    && !gradual_origins.contains(&origin)
+                {
+                    gradual_origins.push(origin);
+                }
+            }
+            gradual_origins.sort_unstable();
+            self.explored_gradual_nodes
+                .insert((node, relevant_path, gradual_origins))
+        };
+        if !is_unexplored {
             return;
         }
 
@@ -102,13 +148,13 @@ impl<'db> SolutionWalker<'db> {
         // the current path.
         let mut visible_typevars = self.inferable_support.clone();
         visible_typevars.close_over_constraints(storage, &Self::constrained_assignments(path));
-        if !visible_typevars.overlaps_with(node_support) {
+        if !visible_typevars.overlaps_with(node_support)
+            && !self.node_has_relevant_gradual_origin(storage, node)
+        {
             // This node cannot affect the solution we've found. Make sure that the node has _at
             // least one_ satisfiable path, without walking them all. As long as it does, we can
             // report the solution we have so far as-is.
-            if Self::node_is_satisfiable_on_path(db, env, storage, path, node) {
-                self.found_satisfied_path(storage, path, &visible_typevars);
-            }
+            self.visit_first_satisfied_path(db, env, storage, path, node, &visible_typevars);
             return;
         }
 
@@ -149,71 +195,84 @@ impl<'db> SolutionWalker<'db> {
         );
     }
 
-    /// Returns if there is _any_ satisfiable path in `node`, assuming that the assignments in
-    /// `path` already hold. Avoids walking the entire subtree if possible, by returning early once
-    /// we find the first satisfied path.
-    fn node_is_satisfiable_on_path(
+    /// Whether this subtree can distinguish gradual occurrences used by an inferred bound.
+    fn node_has_relevant_gradual_origin(
+        &mut self,
+        storage: &ConstraintSetStorage<'db>,
+        node: NodeId,
+    ) -> bool {
+        if self.relevant_gradual_origins.is_empty() || node.is_terminal() {
+            return false;
+        }
+        if let Some(has_relevant_origin) = self.relevant_gradual_nodes.get(&node) {
+            return *has_relevant_origin;
+        }
+
+        let interior = storage.interior_node_data(node);
+        let has_relevant_origin = storage
+            .constraint_data(interior.constraint)
+            .as_gradual()
+            .is_some_and(|variable| self.relevant_gradual_origins.contains(&variable.origin))
+            || self.node_has_relevant_gradual_origin(storage, interior.if_true)
+            || self.node_has_relevant_gradual_origin(storage, interior.if_uncertain)
+            || self.node_has_relevant_gradual_origin(storage, interior.if_false);
+        self.relevant_gradual_nodes
+            .insert(node, has_relevant_origin);
+        has_relevant_origin
+    }
+
+    /// Records the first satisfying path without exploring the remaining subtree.
+    fn visit_first_satisfied_path(
+        &mut self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         storage: &mut ConstraintSetStorage<'db>,
         path: &mut PathAssignments,
         node: NodeId,
+        visible_typevars: &Support,
     ) -> bool {
         match node.node() {
-            Node::AlwaysTrue => return true,
+            Node::AlwaysTrue => {
+                self.found_satisfied_path(storage, path, visible_typevars);
+                return true;
+            }
             Node::AlwaysFalse => return false,
             Node::Interior(_) => {}
         }
 
         let interior = storage.interior_node_data(node);
+        for (assignment, child) in [
+            (interior.constraint.when_true(), interior.if_true),
+            (
+                interior.constraint.when_unconstrained(),
+                interior.if_uncertain,
+            ),
+            (interior.constraint.when_false(), interior.if_false),
+        ] {
+            let satisfied = path.walk_edge(
+                db,
+                env,
+                storage,
+                assignment,
+                |storage, path, _new_range, found_conflict| {
+                    !found_conflict
+                        && self.visit_first_satisfied_path(
+                            db,
+                            env,
+                            storage,
+                            path,
+                            child,
+                            visible_typevars,
+                        )
+                },
+            );
 
-        let true_is_satisfied = path.walk_edge(
-            db,
-            env,
-            storage,
-            interior.constraint.when_true(),
-            |storage, path, _new_range, found_conflict| {
-                if found_conflict {
-                    false
-                } else {
-                    Self::node_is_satisfiable_on_path(db, env, storage, path, interior.if_true)
-                }
-            },
-        );
-        if true_is_satisfied {
-            return true;
+            if satisfied {
+                return true;
+            }
         }
 
-        let uncertain_is_satisfied = path.walk_edge(
-            db,
-            env,
-            storage,
-            interior.constraint.when_unconstrained(),
-            |storage, path, _new_range, found_conflict| {
-                if found_conflict {
-                    false
-                } else {
-                    Self::node_is_satisfiable_on_path(db, env, storage, path, interior.if_uncertain)
-                }
-            },
-        );
-        if uncertain_is_satisfied {
-            return true;
-        }
-
-        path.walk_edge(
-            db,
-            env,
-            storage,
-            interior.constraint.when_false(),
-            |storage, path, _new_range, found_conflict| {
-                if found_conflict {
-                    false
-                } else {
-                    Self::node_is_satisfiable_on_path(db, env, storage, path, interior.if_false)
-                }
-            },
-        )
+        false
     }
 
     fn found_satisfied_path(
@@ -222,19 +281,32 @@ impl<'db> SolutionWalker<'db> {
         path: &PathAssignments,
         visible_typevars: &Support,
     ) {
-        let mut path: Vec<_> =
+        let mut constraints: Vec<_> =
             Self::constrained_assignments_mentioning(storage, path, visible_typevars)
-                .filter(|(assignment, _)| assignment.is_positive())
-                .map(|(assignment, source_constraint)| {
+                .filter(|(assignment, _, _)| assignment.is_positive())
+                .map(|(assignment, source_constraint, provenance)| {
                     let source_order = self
                         .source_orders
                         .get_index_of(&source_constraint)
                         .expect("every TDD constraint should have a source order");
-                    (assignment.constraint(), source_order)
+                    (assignment.constraint(), source_order, provenance)
                 })
                 .collect();
-        path.sort_by_key(|(_, source_order)| *source_order);
-        self.sorted_paths.push(path);
+        constraints.sort_by_key(|(_, source_order, _)| *source_order);
+
+        let mut materialization_origins = SmallVec::new();
+        if storage.has_gradual_variables() {
+            for origin in path.gradual_origins(storage) {
+                if !materialization_origins.contains(&origin) {
+                    materialization_origins.push(origin);
+                }
+            }
+        }
+
+        self.sorted_paths.push(ConstraintPath {
+            constraints,
+            materialization_origins,
+        });
     }
 
     pub(super) fn finish(
@@ -248,14 +320,32 @@ impl<'db> SolutionWalker<'db> {
         }
 
         self.sorted_paths.sort_by(|path1, path2| {
-            let source_orders1 = path1.iter().map(|(_, source_order)| *source_order);
-            let source_orders2 = path2.iter().map(|(_, source_order)| *source_order);
-            source_orders1.cmp(source_orders2)
+            let source_orders1 = path1
+                .constraints
+                .iter()
+                .map(|(_, source_order, _)| *source_order);
+            let source_orders2 = path2
+                .constraints
+                .iter()
+                .map(|(_, source_order, _)| *source_order);
+            source_orders1.cmp(source_orders2).then(
+                path1
+                    .materialization_origins
+                    .is_empty()
+                    .cmp(&path2.materialization_origins.is_empty())
+                    .reverse(),
+            )
         });
-        self.sorted_paths.dedup_by(|path1, path2| {
-            let source_orders1 = path1.iter();
-            let source_orders2 = path2.iter();
-            source_orders1.eq(source_orders2)
+        self.sorted_paths.dedup_by(|path, retained| {
+            if path.constraints != retained.constraints {
+                return false;
+            }
+
+            // A materialization is required only if every equivalent path depends on it.
+            retained
+                .materialization_origins
+                .retain(|origin| path.materialization_origins.contains(origin));
+            true
         });
 
         let mut result = Vec::with_capacity(self.sorted_paths.len());
@@ -269,7 +359,7 @@ impl<'db> SolutionWalker<'db> {
 
         for path in self.sorted_paths {
             mappings.clear();
-            for (constraint, _) in path {
+            for (constraint, _, provenance) in path.constraints {
                 let Some(constraint) = storage.constraint_data(constraint).as_typevar() else {
                     continue;
                 };
@@ -294,38 +384,54 @@ impl<'db> SolutionWalker<'db> {
 
                 if let Some(lower) = constraint.bounds.lower {
                     let bounds = mappings.entry(typevar).or_default();
-                    bounds.add_lower(db, env, lower);
+                    let origin = provenance
+                        .lower
+                        .map(|origin| storage.gradual_origin(origin));
+                    bounds.add_lower(lower, origin);
 
                     if let Type::TypeVar(lower_bound_typevar) = lower {
                         let bounds = mappings.entry(lower_bound_typevar).or_default();
-                        bounds.add_upper(db, env, Type::TypeVar(typevar));
+                        bounds.add_upper(Type::TypeVar(typevar), origin);
                     }
                 }
 
                 if let Some(upper) = constraint.bounds.upper {
                     let bounds = mappings.entry(typevar).or_default();
-                    bounds.add_upper(db, env, upper);
+                    let origin = provenance
+                        .upper
+                        .map(|origin| storage.gradual_origin(origin));
+                    bounds.add_upper(upper, origin);
 
                     if let Type::TypeVar(upper_bound_typevar) = upper {
                         let bounds = mappings.entry(upper_bound_typevar).or_default();
-                        bounds.add_lower(db, env, Type::TypeVar(typevar));
+                        bounds.add_lower(Type::TypeVar(typevar), origin);
                     }
                 }
             }
 
-            if !mappings.is_empty() {
-                any_constrained_solutions = true;
-            }
+            any_constrained_solutions |= !mappings.is_empty();
 
-            let path_bounds = mappings
+            let path_bounds: Box<[_]> = mappings
                 .drain(..)
-                .map(|(bound_typevar, bounds)| bounds.finish(db, env, bound_typevar))
+                .map(|(bound_typevar, bounds)| {
+                    let mut bound = bounds.finish(db, env, bound_typevar);
+                    bound.provenance.materialization_origins = path
+                        .materialization_origins
+                        .iter()
+                        .map(|&origin| storage.gradual_origin(origin))
+                        .collect();
+                    bound
+                })
                 .collect();
             result.push(path_bounds);
         }
 
         if !any_constrained_solutions {
             return PathBounds::Unconstrained;
+        }
+
+        if storage.has_gradual_variables() {
+            result.dedup_by(|left, right| !left.is_empty() && left == right);
         }
 
         PathBounds::Constrained(result.into_boxed_slice())
